@@ -312,11 +312,33 @@ export type DesktopTemplateValues = {
   iconName: string;
 };
 
+function desktopEntryQuote(value: string): string {
+  return `"${value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("`", "\\`")
+    .replaceAll("$", "\\$")
+    // Desktop-entry field codes are expanded even inside quotes; `%%` is the
+    // literal-percent escape.
+    .replaceAll("%", "%%")}"`;
+}
+
 export function renderDesktopTemplate(template: string, values: DesktopTemplateValues): string {
   return template
     .replace(/@@NAMESPACE@@/g, values.namespace)
-    .replace(/@@EXEC_PATH@@/g, values.execPath)
+    .replace(/@@EXEC_PATH@@/g, desktopEntryQuote(values.execPath))
     .replace(/@@ICON_PATH@@/g, values.iconName);
+}
+
+export type LinuxLauncherTemplateValues = {
+  appImagePath: string;
+  namespace: string;
+};
+
+export function renderLinuxLauncher(template: string, values: LinuxLauncherTemplateValues): string {
+  return template
+    .replace(/@@APPIMAGE_PATH@@/g, shellQuote(values.appImagePath))
+    .replace(/@@NAMESPACE@@/g, shellQuote(values.namespace));
 }
 
 export function renderLinuxPackagedMainEntry(): string {
@@ -344,22 +366,58 @@ fi
 # cache and re-exec the cached AppRun on every later launch instead of paying
 # that cost again. The cache key tracks the AppImage path, size, and mtime, so
 # replacing the AppImage never reuses a stale payload.
-appimage_cache_dir() {
+appimage_cache_root() {
   if [ -n "\${XDG_CACHE_HOME:-}" ] ; then
-    cache_root="$XDG_CACHE_HOME"
+    printf '%s' "$XDG_CACHE_HOME"
   elif [ -n "\${HOME:-}" ] ; then
-    cache_root="$HOME/.cache"
+    printf '%s' "$HOME/.cache"
   else
-    cache_root="\${TMPDIR:-/tmp}/open-design-cache-\${UID:-0}"
+    printf '%s' "\${TMPDIR:-/tmp}/open-design-cache-\${UID:-0}"
   fi
+}
+
+appimage_cache_dir() {
+  cache_root="$(appimage_cache_root)"
   key="$(printf '%s' "$APPIMAGE" | cksum | cut -d' ' -f1)-$(stat -c '%s-%Y' "$APPIMAGE" 2>/dev/null || printf 'unknown')"
   printf '%s/open-design/appimage/%s' "$cache_root" "$key"
+}
+
+# The lock is keyed to the AppImage path only, not to the cache key. Replacing
+# the file at the same path (for example, tools-pack linux install while the
+# old build is running) must not create a second instance; the new file still
+# gets a new cache directory because that key includes size and mtime.
+appimage_lock_path() {
+  cache_root="$(appimage_cache_root)"
+  key="$(printf '%s' "$APPIMAGE" | cksum | cut -d' ' -f1)"
+  printf '%s/open-design/appimage/%s.lock' "$cache_root" "$key"
 }
 
 # The runtime's extract-and-run flag is still a valid manual fallback, but it
 # extracts before this script starts and therefore cannot populate this cache.
 # Only the runtime's FUSE mount (APPDIR under a */.mount_* directory) re-execs
 # here; an extracted run (APPDIR=/tmp/appimage_extracted_*) continues normally.
+# The launch lock below still applies to both modes. The lock file is keyed to
+# the AppImage path (stable across replacements) and the fd is inherited
+# through exec into the desktop. The detached sidecar supervisor takes
+# ownership of this fd during bootstrap (OD_APPIMAGE_LOCK_FD) and holds it for
+# the desktop generation, including payload handoffs. A cached AppRun sees the
+# env var and skips re-acquisition.
+lock_path=""
+if [ -z "\${OD_APPIMAGE_LOCK_FD:-}" ] && [ -n "\${APPIMAGE:-}" ] ; then
+  if lock_path="$(appimage_lock_path 2>/dev/null)" ; then
+    lock_parent="$(dirname "$lock_path")"
+    if mkdir -p "$lock_parent" 2>/dev/null ; then
+      if command -v flock >/dev/null 2>&1 && exec 8>"$lock_path" ; then
+        if ! flock -n 8 ; then
+          echo "open-design: Open Design is already running." >&2
+          exit 0
+        fi
+        export OD_APPIMAGE_LOCK_FD=8
+      fi
+    fi
+  fi
+fi
+
 case "\${APPDIR:-}" in
   */.mount_*)
     if [ -z "\${OD_APPIMAGE_EXTRACTED_RUN:-}" ] && [ -n "\${APPIMAGE:-}" ] ; then
@@ -367,17 +425,6 @@ case "\${APPDIR:-}" in
       if cache_dir="$(appimage_cache_dir 2>/dev/null)" ; then
         cache_parent="$(dirname "$cache_dir")"
         if mkdir -p "$cache_parent" 2>/dev/null ; then
-          # A non-blocking launch lock is held for the desktop lifetime. It
-          # prevents rapid repeated clicks from starting competing runtimes and
-          # also serializes the cold extraction: a second launch exits instead
-          # of waiting on a wedged extractor. The fd stays open across exec so
-          # the lock covers the whole desktop process tree.
-          if command -v flock >/dev/null 2>&1 && exec 8>"$cache_dir.lock" ; then
-            if ! flock -n 8 ; then
-              echo "open-design: Open Design is already running." >&2
-              exit 0
-            fi
-          fi
           if [ ! -x "$cache_dir/AppRun" ] ; then
             extract_dir="$cache_parent/.extract.$$"
             rm -rf "$extract_dir"
@@ -515,6 +562,7 @@ type LinuxPaths = {
   installAppImagePath: string;
   installDesktopFilePath: string;
   installIconPath: string;
+  installLauncherPath: string;
   packagedConfigPath: string;
   resourceRoot: string;
   tarballsRoot: string;
@@ -556,6 +604,14 @@ function resolveLinuxPaths(config: ToolPackConfig): LinuxPaths {
       "apps",
       iconFileName(config.namespace),
     ),
+    installLauncherPath: join(
+      home,
+      ".local",
+      "share",
+      "open-design",
+      sanitizeNamespace(config.namespace),
+      "launch.sh",
+    ),
     packagedConfigPath: join(namespaceRoot, "open-design-config.json"),
     resourceRoot: join(namespaceRoot, "resources", "open-design"),
     tarballsRoot: join(namespaceRoot, "tarballs"),
@@ -578,6 +634,27 @@ async function runPnpm(
 
 export type ProductionInstallCommand = { command: string; args: string[] };
 
+// npm 12 blocks dependency install scripts unless the project approves them in
+// its `allowScripts` field. The packaged daemon needs better-sqlite3 and
+// node-pty native bindings; the remaining packages keep the same native/runtime
+// behavior the Linux artifact had under npm 11. Keep this list in sync with
+// `onlyBuiltDependencies` in pnpm-workspace.yaml for the pnpm/container path.
+export const LINUX_ASSEMBLED_ALLOW_SCRIPTS = [
+  "@ffmpeg-installer/linux-x64",
+  "@google/genai",
+  "better-sqlite3",
+  "core-js",
+  "esbuild",
+  "node-pty",
+  "onnxruntime-node",
+  "protobufjs",
+  "sharp",
+] as const;
+
+export function linuxAssembledAllowScripts(): Record<string, true> {
+  return Object.fromEntries(LINUX_ASSEMBLED_ALLOW_SCRIPTS.map((name) => [name, true]));
+}
+
 // Picks the package manager used to materialize the assembled-app node_modules
 // during writeAssembledApp. The default (`npm`) preserves host behavior for
 // developer-machine builds. When the build runs inside
@@ -587,22 +664,47 @@ export type ProductionInstallCommand = { command: string; args: string[] };
 // `--config.node-linker=hoisted` keeps the resulting layout flat so
 // electron-builder packs node_modules the same way it does for npm-installed
 // trees.
+//
+// Native install scripts stay enabled because the packaged daemon runs the
+// assembled `better-sqlite3` binding under the bundled Node binary. Skipping
+// scripts (a common shortcut for avoiding the optional ONNX CUDA download)
+// produces an AppImage that exits with `Could not locate the bindings file`
+// before reporting sidecar status. The CUDA provider is optional; the CPU
+// provider is bundled, so the production install skips the CUDA download by
+// default and leaves `ONNXRUNTIME_NODE_INSTALL_CUDA` as the explicit opt-in.
 export function resolveProductionInstallCommand(env: NodeJS.ProcessEnv): ProductionInstallCommand {
   const pnpmBin = env[PRODUCTION_INSTALL_PNPM_BIN_ENV];
   if (pnpmBin != null && pnpmBin.length > 0) {
     return {
       command: pnpmBin,
-      args: ["install", "--prod", "--no-lockfile", "--config.node-linker=hoisted"],
+      args: [
+        "install",
+        "--prod",
+        "--no-lockfile",
+        "--config.node-linker=hoisted",
+        "--config.ignore-scripts=false",
+      ],
     };
   }
-  return { command: "npm", args: ["install", "--omit=dev", "--no-package-lock"] };
+  return {
+    command: "npm",
+    args: ["install", "--omit=dev", "--no-package-lock", "--ignore-scripts=false"],
+  };
+}
+
+export function resolveProductionInstallEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    npm_config_ignore_scripts: "false",
+    ONNXRUNTIME_NODE_INSTALL_CUDA: env.ONNXRUNTIME_NODE_INSTALL_CUDA ?? "skip",
+  };
 }
 
 async function runProductionInstall(appRoot: string): Promise<void> {
   const { command, args } = resolveProductionInstallCommand(process.env);
   await execFileAsync(command, args, {
     cwd: appRoot,
-    env: process.env,
+    env: resolveProductionInstallEnv(process.env),
   });
 }
 
@@ -692,7 +794,8 @@ async function writeAssembledApp(
     repository: {
       type: "git",
       url: "https://github.com/nexu-io/open-design.git"
-    }
+    },
+    allowScripts: linuxAssembledAllowScripts(),
   };
   await writeFile(paths.assembledPackageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
 
@@ -729,6 +832,29 @@ async function writeLinuxAppImageAppRun(paths: LinuxPaths): Promise<void> {
 }
 
 // --- Step 5: writeLinuxBuilderConfig helper ---
+
+/**
+ * electron-builder's Linux target block.
+ *
+ * Native packages deliberately do not set `executableArgs`. electron-builder's
+ * FpmTarget uses `templates/linux/after-install.tpl`, which installs the
+ * AppArmor profile where supported and marks `chrome-sandbox` setuid (4755)
+ * when unprivileged user namespaces are unavailable. Adding
+ * `["--no-sandbox"]` here would disable Chromium's sandbox for every RPM user
+ * instead of only the hosts that cannot sandbox.
+ */
+export function createLinuxTargetConfig(
+  targets: readonly LinuxElectronTarget[],
+): Record<string, unknown> {
+  return {
+    target: [...targets],
+    icon: linuxResources.icon,
+    category: "Development",
+    synopsis: "Open Design",
+    maintainer: "Open Design Contributors",
+    vendor: "Open Design Team",
+  };
+}
 
 async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths): Promise<void> {
   const targets = resolveLinuxElectronTargets(config.to);
@@ -782,24 +908,12 @@ async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths
       : {}),
     files: ["**/*", "!**/node_modules/.bin", "!**/node_modules/electron{,/**/*}"],
     icon: linuxResources.icon,
-    linux: {
-      target: targets,
-      icon: linuxResources.icon,
-      category: "Development",
-      synopsis: "Open Design",
-      maintainer: "Open Design Contributors",
-      vendor: "Open Design Team",
-      // Native packages cannot rely on the AppImage AppRun sandbox probe, and
-      // electron-builder does not install a setuid chrome-sandbox helper. On
-      // hosts whose AppArmor policy restricts unprivileged user namespaces
-      // (Ubuntu 24.04+) the packaged app would therefore refuse to start, so
-      // native packages take the same explicit fallback the AppImage uses when
-      // its probe fails.
-      ...(buildsAppImage ? {} : { executableArgs: [...LINUX_APPIMAGE_EXECUTABLE_ARGS] }),
-    },
+    linux: createLinuxTargetConfig(targets),
     // Keep the AppImage launch fallback explicit. Our top-level AppRun wrapper
     // clears ELECTRON_RUN_AS_NODE before these Chromium flags reach Electron,
-    // including for AppImageLauncher-generated desktop entries.
+    // including for AppImageLauncher-generated desktop entries, and strips the
+    // flag again when the sandbox probe succeeds. Native packages get their
+    // sandbox setup from electron-builder's after-install template instead.
     appImage: {
       executableArgs: [...LINUX_APPIMAGE_EXECUTABLE_ARGS],
     },
@@ -963,6 +1077,7 @@ export type LinuxInstallResult = {
   appImagePath: string;
   desktopFilePath: string;
   iconPath: string;
+  launcherPath: string;
   namespace: string;
   postInstall: {
     desktopDatabase: "ok" | "missing" | "failed";
@@ -1002,6 +1117,7 @@ export async function installPackedLinuxApp(config: ToolPackConfig): Promise<Lin
   await mkdir(dirname(paths.installAppImagePath), { recursive: true });
   await mkdir(dirname(paths.installDesktopFilePath), { recursive: true });
   await mkdir(dirname(paths.installIconPath), { recursive: true });
+  await mkdir(dirname(paths.installLauncherPath), { recursive: true });
 
   // Copy AppImage with executable bit.
   await cp(builtAppImage, paths.installAppImagePath);
@@ -1010,11 +1126,26 @@ export async function installPackedLinuxApp(config: ToolPackConfig): Promise<Lin
   // Copy icon.
   await cp(linuxResources.icon, paths.installIconPath);
 
+  // The desktop entry must not point at the AppImage directly: the AppImage
+  // runtime mounts its SquashFS before AppRun runs, so a host without
+  // libfuse.so.2 fails before the cache fallback can help. The external
+  // launcher chooses the cached/FUSE path when mounting works and falls back
+  // to --appimage-extract-and-run when it does not.
+  const launcherTemplate = await readFile(linuxResources.launcherTemplate, "utf8");
+  const renderedLauncher = renderLinuxLauncher(launcherTemplate, {
+    appImagePath: paths.installAppImagePath,
+    namespace: sanitizeNamespace(config.namespace),
+  });
+  const tmpLauncherPath = `${paths.installLauncherPath}.tmp`;
+  await writeFile(tmpLauncherPath, renderedLauncher, "utf8");
+  await chmod(tmpLauncherPath, 0o755);
+  await rename(tmpLauncherPath, paths.installLauncherPath);
+
   // Render and atomic-write the .desktop file.
   const template = await readFile(linuxResources.desktopTemplate, "utf8");
   const rendered = renderDesktopTemplate(template, {
     namespace: sanitizeNamespace(config.namespace),
-    execPath: paths.installAppImagePath,
+    execPath: paths.installLauncherPath,
     iconName: `open-design-${sanitizeNamespace(config.namespace)}`,
   });
   const tmpDesktopPath = `${paths.installDesktopFilePath}.tmp`;
@@ -1033,6 +1164,7 @@ export async function installPackedLinuxApp(config: ToolPackConfig): Promise<Lin
     appImagePath: paths.installAppImagePath,
     desktopFilePath: paths.installDesktopFilePath,
     iconPath: paths.installIconPath,
+    launcherPath: paths.installLauncherPath,
     namespace: config.namespace,
     postInstall: { desktopDatabase, iconCache },
   };
@@ -1272,6 +1404,7 @@ export type LinuxUninstallResult = {
     appImage: "ok" | "already-removed";
     desktop: "ok" | "already-removed";
     icon: "ok" | "already-removed";
+    launcher: "ok" | "already-removed";
   };
   stop: LinuxStopResult;
   postUninstall: {
@@ -1306,8 +1439,10 @@ export async function uninstallPackedLinuxApp(config: ToolPackConfig): Promise<L
   const stop = await stopPackedLinuxApp(config);
   assertLinuxStopComplete(stop, "uninstall");
 
-  const removedAppImage = await tryRemove(paths.installAppImagePath);
+  // Remove the desktop entry before the launcher and AppImage it references.
   const removedDesktop = await tryRemove(paths.installDesktopFilePath);
+  const removedLauncher = await tryRemove(paths.installLauncherPath);
+  const removedAppImage = await tryRemove(paths.installAppImagePath);
   const removedIcon = await tryRemove(paths.installIconPath);
 
   const desktopDatabase = await bestEffortRun("update-desktop-database", [
@@ -1319,7 +1454,12 @@ export async function uninstallPackedLinuxApp(config: ToolPackConfig): Promise<L
 
   return {
     namespace: config.namespace,
-    removed: { appImage: removedAppImage, desktop: removedDesktop, icon: removedIcon },
+    removed: {
+      appImage: removedAppImage,
+      desktop: removedDesktop,
+      icon: removedIcon,
+      launcher: removedLauncher,
+    },
     stop,
     postUninstall: { desktopDatabase, iconCache },
   };

@@ -116,6 +116,8 @@ Local lifecycle commands:
 
 Build artifacts are namespace-scoped under `.tmp/tools-pack/out/linux/namespaces/<namespace>/`. Packaged logs, sidecar runtime, cache, and Electron user-data are namespace-scoped under the tools-pack runtime root. Daemon storage follows only the root `AGENTS.md` **Daemon data directory contract**. Containerized build cache lives under `.tmp/tools-pack/.docker-cache/{electron,electron-builder}/`.
 
+The assembled app runs the packaged daemon under the bundled Node binary, so the production install keeps native install scripts enabled and builds `better-sqlite3` for that binary. It defaults `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` to avoid the optional ONNX CUDA download; set `ONNXRUNTIME_NODE_INSTALL_CUDA=1` to opt in. npm 12 blocks dependency install scripts unless the assembled package's `allowScripts` field approves them; the Linux builder writes that list for the native/runtime packages. The pnpm/container path uses the matching `onlyBuiltDependencies` entries in `pnpm-workspace.yaml`. Do not build with `--ignore-scripts` or `npm_config_ignore_scripts=true`: that skips the `better-sqlite3` install script, and the resulting AppImage/RPM exits at launch with `Could not locate the bindings file` before the daemon reports status.
+
 Local installs use XDG paths:
 
 - AppImage: `~/.local/bin/Open-Design.<namespace>.AppImage`
@@ -143,13 +145,15 @@ Headless mode targets environments without a display (WSL2, headless servers, CI
 
 The AppImage runtime mounts the payload through FUSE (`/tmp/.mount_<hex>`), and a plain FUSE mount serves every file through a userspace daemon. On Ubuntu 24.04 and Arch Linux that was slow enough for the packaged daemon to miss its startup budget, because the daemon demand-pages its payload through squashfuse.
 
-The shipped `AppRun` wrapper extracts the payload once into `${XDG_CACHE_HOME:-$HOME/.cache}/open-design/appimage/<key>/` and re-execs the cached copy on every later launch. The key covers the AppImage path, size, and mtime, so replacing the file re-extracts instead of running a stale payload. The first launch pays the extraction cost (roughly two minutes for this payload on a slow disk); later launches start directly from the cache. The cache is not pruned automatically — remove old versions with `rm -rf ~/.cache/open-design/appimage` when reclaiming disk.
+The shipped `AppRun` wrapper extracts the payload once into `${XDG_CACHE_HOME:-$HOME/.cache}/open-design/appimage/<key>/` and re-execs the cached copy on every later launch. The cache key covers the AppImage path, size, and mtime, so replacing the file re-extracts instead of running a stale payload. The first launch pays the extraction cost (roughly two minutes for this payload on a slow disk); later launches start directly from the cache. The cache is not pruned automatically — stop the app first, then remove old versions with `rm -rf ~/.cache/open-design/appimage` when reclaiming disk. The launch lock is keyed to the AppImage path alone, so replacing the file at the same path does not start a second instance while the old build is running; the new build still gets a new cache directory.
 
-The cached path also holds a non-blocking launch lock for the desktop lifetime. A second click exits with `Open Design is already running.` instead of starting a competing runtime, and the same lock serializes the one-time extraction, so a second launch never waits on a wedged extractor.
+`AppRun` acquires a non-blocking launch lock before either launch mode and exports the descriptor as `OD_APPIMAGE_LOCK_FD=8`. The detached sidecar supervisor inherits that descriptor during bootstrap and is the desktop generation root, so it keeps the lock after the initial launcher exits and across payload handoffs. A second click exits with `Open Design is already running.` instead of starting a competing runtime, and the same lock serializes the one-time extraction, so a second launch never waits on a wedged extractor.
 
-`--appimage-extract-and-run` remains a manual fallback for hosts without FUSE: it unpacks into `/tmp/appimage_extracted_<hex>/` and needs no `libfuse2`, but it extracts before `AppRun` starts and therefore cannot populate the cache. `tools-pack linux start` launches the AppImage normally so it exercises the same cache path, and retries through `--appimage-extract-and-run` with `NO_CLEANUP=1` if the runtime cannot mount. Its first-start budget is 600s to cover a cold extraction on slower disks.
+`--appimage-extract-and-run` remains a fallback for hosts without FUSE: it unpacks into `/tmp/appimage_extracted_<hex>/` and needs no `libfuse2`, but it extracts before `AppRun` starts and therefore cannot populate the cache. `tools-pack linux start` launches the AppImage normally so it exercises the same cache path, and retries through `--appimage-extract-and-run` with `NO_CLEANUP=1` if the runtime cannot mount. Its first-start budget is 600s to cover a cold extraction on slower disks.
 
-**What this does not fix:** the AppImage runtime mounts the squashfs *before* `AppRun` runs, so the host still needs `libfuse.so.2` to start the file at all. Where that library is missing, the runtime exits with a `libfuse.so.2` error and nothing inside the AppImage can intervene. Install it, or use a native package (the RPM target below; the `.deb` target is tracked in #6010):
+**Installed desktop launches:** `tools-pack linux install` points the desktop entry at `~/.local/share/open-design/<namespace>/launch.sh`, not the AppImage directly. The launcher checks `/dev/fuse` and `libfuse.so.2`; when mounting is unavailable it runs the AppImage with `--appimage-extract-and-run` and `NO_CLEANUP=1`, so the menu entry still starts on a no-FUSE host. Override the probe with `OD_APPIMAGE_FUSE=on|off|auto`.
+
+**What this does not fix:** the AppImage runtime mounts the squashfs *before* `AppRun` runs, so a raw AppImage launch still needs `libfuse.so.2`. Where that library is missing, the runtime exits with a `libfuse.so.2` error before the AppRun cache or lock code can run; the installed launcher above is what avoids that path. Install the library, use the launcher from `tools-pack linux install`, or use a native package (the RPM target below; the `.deb` target is tracked in #6010):
 
 - Debian / Ubuntu 24.04+: `sudo apt install libfuse2t64` (pre-24.04: `libfuse2`)
 - Fedora / RHEL: `sudo dnf install fuse-libs`
@@ -185,11 +189,13 @@ The `.deb` target is intentionally not included here; the standards-compliant De
 - Debian / Ubuntu: `sudo apt install desktop-file-utils gtk-update-icon-cache`
 - Fedora: `sudo dnf install desktop-file-utils gtk-update-icon-cache`
 
-`libfuse2` is needed for any FUSE-mounted AppImage launch. `AppRun` extracts once into the user cache and re-execs the cached copy, so the slow FUSE reads are paid only on the first launch, but the runtime still refuses to start without `libfuse.so.2`. `tools-pack linux start` uses the same cached path and falls back to `--appimage-extract-and-run` when the runtime cannot mount, so it still works on hosts without FUSE. The native RPM target below is the no-FUSE option for Fedora/RHEL/openSUSE; the `.deb` target is tracked in #6010.
+`libfuse2` is needed for a FUSE-mounted AppImage launch. `AppRun` extracts once into the user cache and re-execs the cached copy, so the slow FUSE reads are paid only on the first launch, but the runtime still refuses to start without `libfuse.so.2`. `tools-pack linux start` uses the same cached path and falls back to `--appimage-extract-and-run` when the runtime cannot mount, and the installed desktop entry uses the external launcher with the same fallback, so both work on hosts without FUSE. The native RPM target below is the no-FUSE option for Fedora/RHEL/openSUSE; the `.deb` target is tracked in #6010.
 
 ### Sandbox / chrome-sandbox
 
 Chromium's namespace sandbox requires unprivileged user namespaces. `AppRun` probes the capability (`unshare -Ur true`), adds `--no-sandbox` only when the probe fails, and strips the unconditional `--no-sandbox` that desktop-integration tooling passes when the sandbox does work. Override the decision with `OD_LINUX_SANDBOX=on` or `OD_LINUX_SANDBOX=off`.
+
+Native RPM packages do not use `--no-sandbox`. electron-builder's FpmTarget `after-install.tpl` installs the AppArmor profile where supported and marks `chrome-sandbox` setuid (4755) when unprivileged user namespaces are unavailable, so the RPM keeps Chromium's sandbox enabled for every user. The AppImage's AppRun probe is the only conditional fallback.
 
 If launches fail on Ubuntu 24.04+ with a namespace error, either let the probe add the fallback or lift the restriction system-wide:
 
