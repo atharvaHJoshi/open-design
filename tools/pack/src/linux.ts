@@ -1,5 +1,6 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, cp, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, join, posix } from "node:path";
 import { promisify } from "node:util";
@@ -994,6 +995,207 @@ async function writeLinuxBuilderConfig(config: ToolPackConfig, paths: LinuxPaths
 
 // --- Step 6: runElectronBuilderLinux + findBuiltAppImage helpers ---
 
+/**
+ * Force electron-builder's manual traversal collector for the assembled app.
+ *
+ * electron-builder 26.8.1's pnpm collector predates pnpm 10.29.3's deduped
+ * dependency listing. pnpm prints a repeated subtree once and later references
+ * it as a childless `deduped` stub; the collector can therefore omit transitive
+ * packages such as jszip's `setimmediate` even though they are present in the
+ * installed tree. The resulting RPM/AppImage starts and then exits with
+ * `Cannot find module 'setimmediate'`.
+ *
+ * The manual traversal collector is electron-builder's supported fallback for
+ * package managers it cannot query. It walks the installed `node_modules` tree
+ * directly, so it does not depend on pnpm's JSON shape and does not need npm or
+ * pnpm on PATH (the official container intentionally ships pnpm only).
+ * electron-builder's package-manager detection checks these npm/pnpm environment
+ * markers before falling back to npm, so mark the child environment as
+ * `traversal`. The marker is build-environment-only and never reaches the app.
+ *
+ * Upstream fixed the pnpm collector in electron-builder 26.9.0; this branch
+ * keeps the pinned 26.8.1 and uses its supported traversal fallback instead of
+ * bumping the dependency in this PR.
+ */
+export function resolveLinuxElectronBuilderEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    npm_config_user_agent: "traversal",
+    npm_execpath: "traversal",
+  };
+}
+
+export type LinuxPackagedDaemonPaths = {
+  appOutDir: string;
+  daemonCliPath: string;
+  nodePath: string;
+};
+
+export function resolveLinuxPackagedDaemonPaths(appBuilderOutputRoot: string): LinuxPackagedDaemonPaths {
+  const appOutDir = join(appBuilderOutputRoot, "linux-unpacked");
+  return {
+    appOutDir,
+    daemonCliPath: join(
+      appOutDir,
+      "resources",
+      "app",
+      "node_modules",
+      "@open-design",
+      "daemon",
+      "dist",
+      "cli.js",
+    ),
+    nodePath: join(appOutDir, "resources", "open-design", "bin", "node"),
+  };
+}
+
+async function reserveEphemeralPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  const port = address != null && typeof address === "object" ? address.port : 0;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  if (child.pid == null || child.exitCode != null || child.signalCode != null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function terminateProbeChild(child: ChildProcess): void {
+  if (child.pid == null || child.exitCode != null || child.signalCode != null) {
+    return;
+  }
+  try {
+    // The probe is detached so the daemon and any short-lived children share a
+    // process group; kill the group so a failed probe cannot leave a daemon
+    // holding the probe port.
+    process.kill(-child.pid, "SIGTERM");
+  } catch {
+    child.kill("SIGTERM");
+  }
+}
+
+/**
+ * Start the packaged daemon from `linux-unpacked` and wait for /api/health.
+ *
+ * This is a packaging gate, not a unit test: it loads the exact dependency tree
+ * electron-builder placed in the artifact, including native bindings, and
+ * catches transitive modules that the collector may have omitted. A daemon that
+ * exits before listening (for example with `Cannot find module 'setimmediate'`)
+ * fails the build instead of producing a broken installer.
+ */
+export async function verifyLinuxPackagedDaemon(
+  paths: { appBuilderOutputRoot: string },
+): Promise<void> {
+  const probe = resolveLinuxPackagedDaemonPaths(paths.appBuilderOutputRoot);
+  if (!(await pathExists(probe.nodePath))) {
+    throw new Error(`packaged daemon probe: bundled Node not found at ${probe.nodePath}`);
+  }
+  if (!(await pathExists(probe.daemonCliPath))) {
+    throw new Error(`packaged daemon probe: daemon CLI not found at ${probe.daemonCliPath}`);
+  }
+
+  const probeRoot = join(paths.appBuilderOutputRoot, ".daemon-probe");
+  const dataDir = join(probeRoot, "data");
+  const homeDir = join(probeRoot, "home");
+  await rm(probeRoot, { force: true, recursive: true });
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(homeDir, { recursive: true });
+
+  const port = await reserveEphemeralPort();
+  let stdout = "";
+  let stderr = "";
+  let spawnError: Error | null = null;
+  const child = spawn(
+    probe.nodePath,
+    [probe.daemonCliPath, "--port", String(port), "--host", "127.0.0.1", "--no-open"],
+    {
+      cwd: probe.appOutDir,
+      detached: process.platform !== "win32",
+      env: {
+        ...process.env,
+        HOME: homeDir,
+        OD_DATA_DIR: dataDir,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  child.stdout?.on("data", (chunk: Buffer) => {
+    stdout += chunk.toString();
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  child.once("error", (error) => {
+    spawnError = error;
+  });
+  const getSpawnError = (): Error | null => spawnError;
+
+  const tail = (value: string): string => (value.length > 4000 ? value.slice(-4000) : value);
+  const failure = (reason: string): Error =>
+    new Error(
+      `packaged daemon probe failed: ${reason}\n` +
+        `--- daemon stdout ---\n${tail(stdout)}\n` +
+        `--- daemon stderr ---\n${tail(stderr)}`,
+    );
+
+  try {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      const currentSpawnError = getSpawnError();
+      if (currentSpawnError != null) {
+        throw failure(`could not start ${probe.nodePath}: ${currentSpawnError.message}`);
+      }
+      if (child.exitCode != null || child.signalCode != null) {
+        throw failure(
+          `daemon exited before becoming healthy (code=${child.exitCode ?? "null"}, signal=${child.signalCode ?? "null"})`,
+        );
+      }
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
+          signal: AbortSignal.timeout(1000),
+        });
+        if (response.ok) {
+          const body = (await response.json()) as { ok?: unknown };
+          if (body.ok === true) {
+            return;
+          }
+        }
+      } catch {
+        // The daemon is still starting (or the health endpoint is not bound
+        // yet); keep polling until the deadline.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw failure(`daemon did not report healthy within 30s on port ${port}`);
+  } finally {
+    terminateProbeChild(child);
+    await waitForChildExit(child, 5000);
+    if (child.pid != null && child.exitCode == null && child.signalCode == null) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+      await waitForChildExit(child, 1000);
+    }
+    await rm(probeRoot, { force: true, recursive: true });
+  }
+}
+
 async function runElectronBuilderLinux(config: ToolPackConfig, paths: LinuxPaths): Promise<void> {
   await rm(paths.appBuilderOutputRoot, { force: true, recursive: true });
   const args = [
@@ -1008,8 +1210,16 @@ async function runElectronBuilderLinux(config: ToolPackConfig, paths: LinuxPaths
   ];
   await execFileAsync(process.execPath, args, {
     cwd: config.workspaceRoot,
-    env: process.env,
+    env: resolveLinuxElectronBuilderEnv(process.env),
   });
+  try {
+    await verifyLinuxPackagedDaemon(paths);
+  } catch (error) {
+    // Do not leave a broken installer next to a failed probe; the next build
+    // would otherwise be able to hand off the same artifact by path.
+    await rm(paths.appBuilderOutputRoot, { force: true, recursive: true });
+    throw error;
+  }
 }
 
 export function classifyLinuxBuilderArtifacts(

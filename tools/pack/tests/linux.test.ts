@@ -72,8 +72,10 @@ import {
   renderLinuxLauncher,
   renderLinuxPackagedMainEntry,
   renderLinuxPnpmWorkspace,
+  resolveLinuxElectronBuilderEnv,
   resolveLinuxElectronTargets,
   resolveLinuxLifecycleMode,
+  resolveLinuxPackagedDaemonPaths,
   resolveProductionInstallCommand,
   resolveProductionInstallEnv,
   linuxAssembledAllowScripts,
@@ -82,6 +84,7 @@ import {
   stopPackedLinuxApp,
   sanitizeNamespace,
   stopPackedLinuxHeadless,
+  verifyLinuxPackagedDaemon,
 } from "@/linux.js";
 import { linuxResources } from "@/resources/index.js";
 
@@ -664,6 +667,93 @@ describe("renderLinuxPnpmWorkspace", () => {
       'overrides:\n' +
       '  "@open-design/registry-protocol": "file:/tmp/registry-protocol.tgz"\n',
     );
+  });
+});
+
+describe("resolveLinuxElectronBuilderEnv", () => {
+  it("forces electron-builder's traversal collector for pnpm-installed trees", () => {
+    const input = {
+      PATH: "/bin",
+      npm_config_user_agent: "pnpm/10.33.2",
+      npm_execpath: "/opt/pnpm/bin/pnpm.cjs",
+    };
+    const env = resolveLinuxElectronBuilderEnv(input);
+    expect(env).toMatchObject({
+      PATH: "/bin",
+      npm_config_user_agent: "traversal",
+      npm_execpath: "traversal",
+    });
+    expect(input.npm_config_user_agent).toBe("pnpm/10.33.2");
+  });
+});
+
+describe("resolveLinuxPackagedDaemonPaths", () => {
+  it("targets the electron-builder linux-unpacked app and bundled Node", () => {
+    expect(resolveLinuxPackagedDaemonPaths("/out")).toEqual({
+      appOutDir: join("/out", "linux-unpacked"),
+      daemonCliPath: join(
+        "/out",
+        "linux-unpacked",
+        "resources",
+        "app",
+        "node_modules",
+        "@open-design",
+        "daemon",
+        "dist",
+        "cli.js",
+      ),
+      nodePath: join("/out", "linux-unpacked", "resources", "open-design", "bin", "node"),
+    });
+  });
+});
+
+describe("verifyLinuxPackagedDaemon", () => {
+  const canRunProbe = process.platform !== "win32";
+
+  async function makeProbeFixture(daemonScript: string): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "open-design-daemon-probe-"));
+    const paths = resolveLinuxPackagedDaemonPaths(root);
+    await mkdir(paths.appOutDir, { recursive: true });
+    await mkdir(dirname(paths.nodePath), { recursive: true });
+    await mkdir(dirname(paths.daemonCliPath), { recursive: true });
+    // The probe only needs a runnable Node entrypoint; delegate to the Node
+    // running the test suite instead of copying the ~120 MB binary.
+    await writeFile(paths.nodePath, '#!/bin/sh\nexec node "$@"\n', "utf8");
+    await chmod(paths.nodePath, 0o755);
+    await writeFile(paths.daemonCliPath, daemonScript, "utf8");
+    return root;
+  }
+
+  it.skipIf(!canRunProbe)("accepts a packaged daemon that reports healthy", async () => {
+    const root = await makeProbeFixture(`
+const http = require("node:http");
+const portIndex = process.argv.indexOf("--port");
+const port = Number(process.argv[portIndex + 1]);
+const server = http.createServer((_request, response) => {
+  response.setHeader("content-type", "application/json");
+  response.end(JSON.stringify({ ok: true }));
+});
+server.listen(port, "127.0.0.1");
+process.on("SIGTERM", () => process.exit(0));
+`);
+    try {
+      await expect(
+        verifyLinuxPackagedDaemon({ appBuilderOutputRoot: root }),
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!canRunProbe)("rejects a packaged daemon that exits before listening", async () => {
+    const root = await makeProbeFixture("process.exit(1);\n");
+    try {
+      await expect(
+        verifyLinuxPackagedDaemon({ appBuilderOutputRoot: root }),
+      ).rejects.toThrow(/daemon exited before becoming healthy/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
