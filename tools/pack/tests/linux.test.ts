@@ -64,12 +64,14 @@ import {
   createLinuxTargetConfig,
   inspectPackedLinuxApp,
   LINUX_APPIMAGE_EXECUTABLE_ARGS,
+  LINUX_RPM_DEPENDS,
   linuxRpmBuilderOptions,
   matchesAppImageProcess,
   renderDesktopTemplate,
   renderLinuxAppImageAppRun,
   renderLinuxLauncher,
   renderLinuxPackagedMainEntry,
+  renderLinuxPnpmWorkspace,
   resolveLinuxElectronTargets,
   resolveLinuxLifecycleMode,
   resolveProductionInstallCommand,
@@ -641,6 +643,107 @@ describe("linuxAssembledAllowScripts", () => {
   });
 });
 
+describe("renderLinuxPnpmWorkspace", () => {
+  it("renders pnpm 10's native build approval list", () => {
+    const workspace = renderLinuxPnpmWorkspace();
+    expect(workspace).toContain("onlyBuiltDependencies:");
+    expect(workspace).toContain('  - "better-sqlite3"');
+    expect(workspace).toContain('  - "node-pty"');
+    expect(workspace).toContain('  - "@ffmpeg-installer/linux-x64"');
+  });
+
+  it("renders caller-provided approvals and internal-tarball overrides", () => {
+    expect(
+      renderLinuxPnpmWorkspace(
+        ["@open-design/daemon"],
+        { "@open-design/registry-protocol": "file:/tmp/registry-protocol.tgz" },
+      ),
+    ).toBe(
+      'onlyBuiltDependencies:\n' +
+      '  - "@open-design/daemon"\n' +
+      'overrides:\n' +
+      '  "@open-design/registry-protocol": "file:/tmp/registry-protocol.tgz"\n',
+    );
+  });
+});
+
+describe("pnpm approval in the assembled project", () => {
+  it("runs a native postinstall and resolves internal tarballs from a temp directory outside the workspace", async () => {
+    const root = await mkdtemp(join(tmpdir(), "open-design-pnpm-approval-"));
+    const registryName = "@open-design/registry-protocol";
+    const daemonName = "@open-design/daemon";
+    const registryRoot = join(root, "registry-protocol");
+    const daemonRoot = join(root, "daemon");
+    const appRoot = join(root, "app");
+    try {
+      await mkdir(registryRoot, { recursive: true });
+      await writeFile(
+        join(registryRoot, "package.json"),
+        `${JSON.stringify({
+          name: registryName,
+          version: "0.5.0",
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await execFileAsync("npm", ["pack", "--pack-destination", root], { cwd: registryRoot });
+      const registryTarball = join(root, "open-design-registry-protocol-0.5.0.tgz");
+
+      await mkdir(daemonRoot, { recursive: true });
+      await writeFile(
+        join(daemonRoot, "package.json"),
+        `${JSON.stringify({
+          name: daemonName,
+          version: "0.25.1",
+          dependencies: { [registryName]: "0.5.0" },
+          scripts: {
+            postinstall: "node -e \"require('fs').writeFileSync('built.txt','yes')\"",
+          },
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await execFileAsync("npm", ["pack", "--pack-destination", root], { cwd: daemonRoot });
+      const daemonTarball = join(root, "open-design-daemon-0.25.1.tgz");
+
+      await mkdir(appRoot, { recursive: true });
+      await writeFile(
+        join(appRoot, "package.json"),
+        `${JSON.stringify({
+          name: "open-design-packaged",
+          version: "0.0.0",
+          private: true,
+          // Pin the version the container uses so a newer global pnpm still
+          // delegates to pnpm 10 and exercises its onlyBuiltDependencies path.
+          packageManager: "pnpm@10.33.2",
+          dependencies: {
+            [registryName]: `file:${registryTarball}`,
+            [daemonName]: `file:${daemonTarball}`,
+          },
+        }, null, 2)}\n`,
+        "utf8",
+      );
+      await writeFile(
+        join(appRoot, "pnpm-workspace.yaml"),
+        renderLinuxPnpmWorkspace([daemonName], { [registryName]: `file:${registryTarball}` }),
+        "utf8",
+      );
+
+      const pnpmBin = process.env.OD_TOOLS_PACK_TEST_PNPM_BIN ?? "pnpm";
+      const install = resolveProductionInstallCommand({ OD_TOOLS_PACK_PNPM_BIN: pnpmBin });
+      await execFileAsync(install.command, install.args, {
+        cwd: appRoot,
+        env: resolveProductionInstallEnv(process.env),
+      });
+
+      await expect(readFile(join(appRoot, "node_modules", daemonName, "built.txt"), "utf8"))
+        .resolves.toBe("yes");
+      await expect(readFile(join(appRoot, "node_modules", registryName, "package.json"), "utf8"))
+        .resolves.toContain('"version": "0.5.0"');
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 60_000);
+});
+
 describe("renderDesktopTemplate", () => {
   const template = `[Desktop Entry]
 Type=Application
@@ -903,8 +1006,25 @@ describe("resolveLinuxElectronTargets", () => {
 describe("linuxRpmBuilderOptions", () => {
   it("pins fpm's single-threaded xz encoder for RPM payloads", () => {
     expect(linuxRpmBuilderOptions(["rpm"])).toEqual({
+      depends: [...LINUX_RPM_DEPENDS],
       fpm: ["--rpm-compression", "xz"],
     });
+  });
+
+  it("declares Electron's gbm and ALSA sonames in addition to the Fedora defaults", () => {
+    const depends = linuxRpmBuilderOptions(["rpm"])?.depends ?? [];
+    expect(depends).toEqual(expect.arrayContaining([
+      "gtk3",
+      "libnotify",
+      "nss",
+      "libXScrnSaver",
+      "(libXtst or libXtst6)",
+      "xdg-utils",
+      "at-spi2-core",
+      "(libuuid or libuuid1)",
+      "libgbm.so.1()(64bit)",
+      "libasound.so.2()(64bit)",
+    ]));
   });
 
   it("leaves non-RPM targets on electron-builder's default", () => {

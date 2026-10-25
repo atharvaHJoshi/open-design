@@ -103,6 +103,29 @@ export function resolveLinuxElectronTargets(to: ToolPackConfig["to"]): LinuxElec
 }
 
 /**
+ * RPM dependencies for the native package.
+ *
+ * The first block mirrors electron-builder's Fedora/RHEL defaults (the
+ * `depends` field replaces them rather than appending). The last two sonames
+ * are Electron 41 runtime links: `gtk3` does not pull them on Fedora, so
+ * `dnf install` succeeds but the binary then fails with
+ * `error while loading shared libraries: libgbm.so.1`. Sonames resolve on
+ * Fedora/RHEL/openSUSE, where the providing package names differ.
+ */
+export const LINUX_RPM_DEPENDS = [
+  "gtk3",
+  "libnotify",
+  "nss",
+  "libXScrnSaver",
+  "(libXtst or libXtst6)",
+  "xdg-utils",
+  "at-spi2-core",
+  "(libuuid or libuuid1)",
+  "libgbm.so.1()(64bit)",
+  "libasound.so.2()(64bit)",
+] as const;
+
+/**
  * RPM packaging options that keep the payload encoder memory-bounded.
  *
  * electron-builder rewrites its `"xz"` default to fpm's `"xzmt"` (threaded
@@ -114,9 +137,9 @@ export function resolveLinuxElectronTargets(to: ToolPackConfig["to"]): LinuxElec
  */
 export function linuxRpmBuilderOptions(
   targets: readonly LinuxElectronTarget[],
-): { fpm: string[] } | null {
+): { depends: string[]; fpm: string[] } | null {
   if (!targets.includes("rpm")) return null;
-  return { fpm: ["--rpm-compression", "xz"] };
+  return { depends: [...LINUX_RPM_DEPENDS], fpm: ["--rpm-compression", "xz"] };
 }
 
 export type LinuxArtifacts = {
@@ -637,8 +660,10 @@ export type ProductionInstallCommand = { command: string; args: string[] };
 // npm 12 blocks dependency install scripts unless the project approves them in
 // its `allowScripts` field. The packaged daemon needs better-sqlite3 and
 // node-pty native bindings; the remaining packages keep the same native/runtime
-// behavior the Linux artifact had under npm 11. Keep this list in sync with
-// `onlyBuiltDependencies` in pnpm-workspace.yaml for the pnpm/container path.
+// behavior the Linux artifact had under npm 11. The same list is rendered into
+// the assembled app's `pnpm-workspace.yaml`, because the containerized build
+// puts the assembled app outside the repository workspace and pnpm 10 does not
+// read npm's `allowScripts`.
 export const LINUX_ASSEMBLED_ALLOW_SCRIPTS = [
   "@ffmpeg-installer/linux-x64",
   "@google/genai",
@@ -653,6 +678,36 @@ export const LINUX_ASSEMBLED_ALLOW_SCRIPTS = [
 
 export function linuxAssembledAllowScripts(): Record<string, true> {
   return Object.fromEntries(LINUX_ASSEMBLED_ALLOW_SCRIPTS.map((name) => [name, true]));
+}
+
+// pnpm 10 approves dependency build scripts only when the package is listed in
+// `onlyBuiltDependencies` in the nearest `pnpm-workspace.yaml`. The assembled
+// app is materialized under `/tools-pack` in the containerized build, so the
+// repository's pnpm-workspace.yaml is not an ancestor and cannot approve the
+// binding builds. Render the same approval list next to the generated
+// package.json instead.
+//
+// The internal workspace tarballs reference sibling packages by version
+// (`@open-design/contracts: 0.25.1`), not by `file:`. npm hoists the root's
+// tarball dependencies and resolves them; pnpm's strict resolver would ask the
+// public registry and get a 404. Override each internal package back to the
+// root tarball so the containerized install stays self-contained.
+export function renderLinuxPnpmWorkspace(
+  packages: readonly string[] = LINUX_ASSEMBLED_ALLOW_SCRIPTS,
+  overrides: Readonly<Record<string, string>> = {},
+): string {
+  const lines = [
+    "onlyBuiltDependencies:",
+    ...packages.map((name) => `  - ${JSON.stringify(name)}`),
+  ];
+  const entries = Object.entries(overrides);
+  if (entries.length > 0) {
+    lines.push(
+      "overrides:",
+      ...entries.map(([name, spec]) => `  ${JSON.stringify(name)}: ${JSON.stringify(spec)}`),
+    );
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 // Picks the package manager used to materialize the assembled-app node_modules
@@ -798,6 +853,16 @@ async function writeAssembledApp(
     allowScripts: linuxAssembledAllowScripts(),
   };
   await writeFile(paths.assembledPackageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`, "utf8");
+
+  // The pnpm/container path runs outside the repository workspace, so the
+  // repo-level onlyBuiltDependencies and overrides do not apply. Keep both the
+  // native-build approval list and the internal-tarball overrides beside the
+  // generated package.json for that install.
+  await writeFile(
+    join(paths.assembledAppRoot, "pnpm-workspace.yaml"),
+    renderLinuxPnpmWorkspace(LINUX_ASSEMBLED_ALLOW_SCRIPTS, dependencies),
+    "utf8",
+  );
 
   await writeFile(paths.assembledMainEntryPath, renderLinuxPackagedMainEntry(), "utf8");
 

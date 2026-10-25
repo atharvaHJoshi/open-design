@@ -116,7 +116,7 @@ Local lifecycle commands:
 
 Build artifacts are namespace-scoped under `.tmp/tools-pack/out/linux/namespaces/<namespace>/`. Packaged logs, sidecar runtime, cache, and Electron user-data are namespace-scoped under the tools-pack runtime root. Daemon storage follows only the root `AGENTS.md` **Daemon data directory contract**. Containerized build cache lives under `.tmp/tools-pack/.docker-cache/{electron,electron-builder}/`.
 
-The assembled app runs the packaged daemon under the bundled Node binary, so the production install keeps native install scripts enabled and builds `better-sqlite3` for that binary. It defaults `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` to avoid the optional ONNX CUDA download; set `ONNXRUNTIME_NODE_INSTALL_CUDA=1` to opt in. npm 12 blocks dependency install scripts unless the assembled package's `allowScripts` field approves them; the Linux builder writes that list for the native/runtime packages. The pnpm/container path uses the matching `onlyBuiltDependencies` entries in `pnpm-workspace.yaml`. Do not build with `--ignore-scripts` or `npm_config_ignore_scripts=true`: that skips the `better-sqlite3` install script, and the resulting AppImage/RPM exits at launch with `Could not locate the bindings file` before the daemon reports status.
+The assembled app runs the packaged daemon under the bundled Node binary, so the production install keeps native install scripts enabled and builds `better-sqlite3` for that binary. It defaults `ONNXRUNTIME_NODE_INSTALL_CUDA=skip` to avoid the optional ONNX CUDA download; set `ONNXRUNTIME_NODE_INSTALL_CUDA=1` to opt in. npm 12 blocks dependency install scripts unless the assembled package's `allowScripts` field approves them; the Linux builder writes that list for the native/runtime packages. pnpm 10 ignores npm's `allowScripts`, and the containerized assembled app lives under `/tools-pack` outside the repository workspace, so the builder also renders the same list into the assembled app's `pnpm-workspace.yaml` as `onlyBuiltDependencies`. Do not build with `--ignore-scripts` or `npm_config_ignore_scripts=true`: that skips the `better-sqlite3` install script, and the resulting AppImage/RPM exits at launch with `Could not locate the bindings file` before the daemon reports status.
 
 Local installs use XDG paths:
 
@@ -175,6 +175,8 @@ sudo dnf install ./open-design-default.rpm
 ```
 
 The RPM installs system-wide (electron-builder's `/opt` layout, desktop entry, icons) and is the artifact to hand to a non-developer. It is **not** part of the `tools-pack linux install/start/stop/uninstall` lifecycle — that lifecycle stays AppImage-scoped because it manages a user-local, namespace-scoped copy. `all` deliberately remains AppImage-only so release lanes never depend on distro packaging tooling.
+
+The RPM's `Requires` includes electron-builder's Fedora defaults plus the `libgbm.so.1()(64bit)` and `libasound.so.2()(64bit)` sonames Electron 41 loads at runtime. Fedora does not pull those through `gtk3`; without them `dnf install` succeeds but the installed binary exits with `error while loading shared libraries` before Electron starts.
 
 The `.deb` target is intentionally not included here; the standards-compliant Debian package is tracked in #6010. The RPM build uses electron-builder's bundled `fpm`, which needs host tooling:
 
